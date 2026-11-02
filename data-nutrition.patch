@@ -1,0 +1,1689 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Sun, 1 Nov 2026 12:00:00 -0600
+Subject: [PATCH 0/8] Data Nutrition Label for DSpace 9.2 (backend + Angular UI)
+
+Computes a 0-100 quality score and A-F grade for archived items, stored
+as nutrition.* metadata, and shows it as a badge on the item page.
+
+This file holds two patch series for two repositories:
+
+  [PATCH backend 1/4..4/4]  DSpace 9.2 backend (DSpace/DSpace)
+  [PATCH angular 1/4..4/4]  DSpace Angular 9.2 UI (DSpace/dspace-angular)
+
+Split it and apply each series to its own repository:
+
+  mkdir dn && git mailsplit -odn data-nutrition.patch
+  cd DSpace          && git am --3way $(grep -l '^Subject: \[PATCH backend' ../dn/* | sort)
+  cd ../dspace-angular && git am --3way $(grep -l '^Subject: \[PATCH angular' ../dn/* | sort)
+
+(Adjust the ../dn paths to wherever you split the file.)
+
+After applying the backend series, load the schema once and backfill:
+
+  [dspace]/bin/dspace registry-loader -metadata [dspace]/config/registries/nutrition-types.xml
+  [dspace]/bin/dspace curate -t datanutrition -i all
+
+If local.cfg overrides event.dispatcher.default.consumers, add
+'nutrition' to it. Turn the feature off with nutrition.label.enable = false.
+
+The UI requires the backend series (backend 2/4 exposes
+nutrition.label.enable over REST).
+
+-- 
+From aa7c0bf4567136fbff1b355ea0a90a66b84737ff Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Sun, 14 Jun 2026 12:09:14 -0500
+Subject: [PATCH backend 1/4] add custom feature to compute a quality
+ 'nutrition label' for archived items
+
+(cherry picked from commit 5a11399883ae5a7ce674e374f4d96aa0a3c73a93)
+(cherry picked from commit 4ce9f5ad9459b50186f0e264d55ce07b60da2013)
+---
+ .../ctask/nutrition/DataNutritionLabel.java   |  57 ++++++
+ .../dspace/nutrition/NutritionConsumer.java   | 131 +++++++++++++
+ .../org/dspace/nutrition/NutritionScorer.java |  35 ++++
+ .../dspace/nutrition/NutritionScorerImpl.java | 177 ++++++++++++++++++
+ dspace/config/modules/curate.cfg              |   2 +
+ dspace/config/registries/nutrition-types.xml  |  53 ++++++
+ dspace/config/spring/api/nutrition.xml        |  17 ++
+ 7 files changed, 472 insertions(+)
+ create mode 100644 dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+ create mode 100644 dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+ create mode 100644 dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
+ create mode 100644 dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
+ create mode 100644 dspace/config/registries/nutrition-types.xml
+ create mode 100644 dspace/config/spring/api/nutrition.xml
+
+diff --git a/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+new file mode 100644
+index 0000000..5fcae96
+--- /dev/null
++++ b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+@@ -0,0 +1,57 @@
++package org.dspace.ctask.nutrition;
++
++import java.io.IOException;
++import java.sql.SQLException;
++
++import org.dspace.authorize.AuthorizeException;
++import org.dspace.content.DSpaceObject;
++import org.dspace.content.Item;
++import org.dspace.core.Constants;
++import org.dspace.curate.AbstractCurationTask;
++import org.dspace.curate.Curator;
++import org.dspace.nutrition.NutritionScorer;
++import org.dspace.services.factory.DSpaceServicesFactory;
++
++/**
++ * Curation task wrapper around {@link NutritionScorer}, for manual and batch use, e.g.:
++ *
++ * <pre>
++ *   [dspace]/bin/dspace curate -t datanutrition -i 123456789/42   # one item
++ *   [dspace]/bin/dspace curate -t datanutrition -i all            # backfill the repository
++ * </pre>
++ *
++ * <p>Automatic assessment (at archival and on edit) is handled by
++ * {@link org.dspace.nutrition.NutritionConsumer}; this task is not wired into
++ * workflow-curation.xml.
++ */
++public class DataNutritionLabel extends AbstractCurationTask {
++
++    private NutritionScorer scorer;
++
++    @Override
++    public void init(Curator curator, String taskId) throws IOException {
++        super.init(curator, taskId);
++        // Tasks aren't Spring beans, so pull the service from the container by name.
++        this.scorer = DSpaceServicesFactory.getInstance().getServiceManager()
++                .getServiceByName(NutritionScorer.class.getName(), NutritionScorer.class);
++    }
++
++    @Override
++    public int perform(DSpaceObject dso) throws IOException {
++        if (dso.getType() != Constants.ITEM) {
++            setResult("Data Nutrition Label applies to items only; skipped.");
++            return Curator.CURATE_SKIP;
++        }
++        Item item = (Item) dso;
++        try {
++            scorer.assessAndWrite(Curator.curationContext(), item);
++            String grade = item.getItemService()
++                    .getMetadataFirstValue(item, "nutrition", "grade", null, Item.ANY);
++            setResult("Data Nutrition grade " + grade + " written for " + item.getHandle());
++            return Curator.CURATE_SUCCESS;
++        } catch (SQLException | AuthorizeException e) {
++            setResult("Error assessing item: " + e.getMessage());
++            return Curator.CURATE_ERROR;
++        }
++    }
++}
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+new file mode 100644
+index 0000000..5b65b37
+--- /dev/null
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+@@ -0,0 +1,131 @@
++package org.dspace.nutrition;
++
++import java.sql.SQLException;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.UUID;
++
++import org.dspace.content.Item;
++import org.dspace.content.factory.ContentServiceFactory;
++import org.dspace.content.service.ItemService;
++import org.dspace.content.service.WorkspaceItemService;
++import org.dspace.core.Constants;
++import org.dspace.core.Context;
++import org.dspace.event.Consumer;
++import org.dspace.event.Event;
++import org.dspace.services.factory.DSpaceServicesFactory;
++import org.dspace.workflow.WorkflowItemService;
++import org.dspace.workflow.factory.WorkflowServiceFactory;
++
++/**
++ * Re-assesses an item's Data Nutrition Label automatically:
++ * <ul>
++ *   <li>once at archival (Item+Install), reflecting the final approved version, and</li>
++ *   <li>on every substantive edit afterwards (Modify / Modify_Metadata / Add / Remove).</li>
++ * </ul>
++ *
++ * <p><b>Recursion guard.</b> {@link NutritionScorer#assessAndWrite} only ever writes
++ * nutrition.* metadata, which is excluded from the content fingerprint. If the current
++ * fingerprint still equals the stored one, the change was our own write (or an admin
++ * editing the label by hand) and is skipped — so the label write cannot re-trigger scoring.
++ *
++ * <p><b>Workflow guard.</b> Drafts and in-review items (in_archive = false, or still
++ * referenced by a workspace/workflow record) are skipped, so reviewer edits during a
++ * multi-step approval don't thrash the scorer before the item is finalized.
++ */
++public class NutritionConsumer implements Consumer {
++
++    private ItemService itemService;
++    private WorkspaceItemService workspaceItemService;
++    private WorkflowItemService workflowItemService;
++    private NutritionScorer scorer;
++
++    // Per-transaction work list. Populated in consume(), drained in end().
++    // Matches DSpace core consumers (e.g. IndexEventConsumer), which use plain
++    // instance fields reset each transaction.
++    private Set<UUID> toProcess;
++
++    @Override
++    public void initialize() throws Exception {
++        itemService = ContentServiceFactory.getInstance().getItemService();
++        workspaceItemService = ContentServiceFactory.getInstance().getWorkspaceItemService();
++        workflowItemService = WorkflowServiceFactory.getInstance().getWorkflowItemService();
++        // Consumers are not Spring beans, so look the service up from the container by name.
++        scorer = DSpaceServicesFactory.getInstance().getServiceManager()
++                .getServiceByName(NutritionScorer.class.getName(), NutritionScorer.class);
++    }
++
++    @Override
++    public void consume(Context ctx, Event event) throws Exception {
++        if (toProcess == null) {
++            toProcess = new HashSet<>();
++        }
++        if (event.getSubjectType() != Constants.ITEM) {
++            return;
++        }
++        UUID itemId = event.getSubjectID();
++        if (itemId == null || toProcess.contains(itemId)) {
++            return;                              // null subject, or already queued this transaction
++        }
++
++        Item item = (Item) event.getSubject(ctx);
++        if (item == null || item.isWithdrawn()) {
++            return;
++        }
++
++        // ---- Workflow guard -------------------------------------------------------------
++        // Cheap skip: drafts and in-review items have in_archive = false.
++        if (!item.isArchived()) {
++            return;
++        }
++        // Explicit, intent-documenting backstop (also survives the check above being
++        // loosened later, and the rare archived-but-still-in-flux edge).
++        if (inSubmissionOrWorkflow(ctx, item)) {
++            return;
++        }
++
++        // ---- Recursion guard ------------------------------------------------------------
++        // Stored fingerprint is null on a never-assessed item, so first-time items
++        // (including freshly archived ones via Install) fall through and get queued.
++        String current = scorer.computeFingerprint(ctx, item);
++        String stored = itemService.getMetadataFirstValue(item, "nutrition", "fingerprint", null, Item.ANY);
++        if (current.equals(stored)) {
++            return;
++        }
++
++        toProcess.add(itemId);
++    }
++
++    @Override
++    public void end(Context ctx) throws Exception {
++        if (toProcess == null) {
++            return;
++        }
++        for (UUID id : toProcess) {
++            Item item = itemService.find(ctx, id);
++            if (item != null && item.isArchived() && !item.isWithdrawn()) {
++                // The triggering user may lack write rights; the label is a system
++                // annotation, so elevate just for this write.
++                ctx.turnOffAuthorisationSystem();
++                try {
++                    scorer.assessAndWrite(ctx, item);
++                } finally {
++                    ctx.restoreAuthSystemState();
++                }
++            }
++        }
++        toProcess.clear();
++        toProcess = null;                        // reset for the next transaction
++    }
++
++    @Override
++    public void finish(Context ctx) throws Exception {
++        // No external resources to release.
++    }
++
++    /** True while the item is still in submission or mid-approval (not a finalized, archived item). */
++    private boolean inSubmissionOrWorkflow(Context ctx, Item item) throws SQLException {
++        return workspaceItemService.findByItem(ctx, item) != null
++                || workflowItemService.findByItem(ctx, item) != null;
++    }
++}
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
+new file mode 100644
+index 0000000..5cded5c
+--- /dev/null
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
+@@ -0,0 +1,35 @@
++package org.dspace.nutrition;
++
++import java.io.IOException;
++import java.sql.SQLException;
++
++import org.dspace.authorize.AuthorizeException;
++import org.dspace.content.Item;
++import org.dspace.core.Context;
++
++/**
++ * Computes the "Data Nutrition Label" for an item and persists it as nutrition.* metadata.
++ *
++ * <p>Shared by both entry points so the submission/archival path and the edit path run
++ * identical logic:
++ * <ul>
++ *   <li>{@link org.dspace.ctask.nutrition.DataNutritionLabel} (curation task, for manual/batch runs)</li>
++ *   <li>{@link NutritionConsumer} (event consumer, for archival + post-archive edits)</li>
++ * </ul>
++ */
++public interface NutritionScorer {
++
++    /**
++     * Assess the item across all dimensions and write nutrition.score, nutrition.grade,
++     * nutrition.completeness, nutrition.report, nutrition.assessed and nutrition.fingerprint
++     * in a single update.
++     */
++    void assessAndWrite(Context ctx, Item item) throws SQLException, IOException, AuthorizeException;
++
++    /**
++     * A stable hash of the item's substantive content — all metadata EXCEPT the nutrition
++     * schema, plus bitstream formats/sizes. Excluding the nutrition schema is what makes the
++     * re-assessment loop terminate: writing the label cannot change this value.
++     */
++    String computeFingerprint(Context ctx, Item item) throws SQLException;
++}
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
+new file mode 100644
+index 0000000..e8e1c5d
+--- /dev/null
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
+@@ -0,0 +1,177 @@
++package org.dspace.nutrition;
++
++import java.io.IOException;
++import java.sql.SQLException;
++import java.time.Instant;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.apache.commons.codec.digest.DigestUtils;
++import org.dspace.authorize.AuthorizeException;
++import org.dspace.content.Bitstream;
++import org.dspace.content.Bundle;
++import org.dspace.content.Item;
++import org.dspace.content.MetadataField;
++import org.dspace.content.MetadataValue;
++import org.dspace.content.factory.ContentServiceFactory;
++import org.dspace.content.service.ItemService;
++import org.dspace.core.Context;
++
++/**
++ * Default {@link NutritionScorer}. Registered as a Spring bean in
++ * config/spring/api/nutrition.xml under the interface's fully-qualified name so that the
++ * (non-Spring) consumer and curation task can look it up via the service manager.
++ *
++ * <p>The scoring rubric below is a starting set — tune the dimensions and weighting to
++ * reflect what your repository considers "good data".
++ */
++public class NutritionScorerImpl implements NutritionScorer {
++
++    private final ItemService itemService = ContentServiceFactory.getInstance().getItemService();
++    private final ObjectMapper mapper = new ObjectMapper();
++
++    /** Open / archival-friendly formats earn full marks on the openness dimension. */
++    private static final Set<String> OPEN_FORMATS = new HashSet<>(Arrays.asList(
++            "text/csv", "application/json", "text/plain", "text/xml",
++            "application/xml", "application/pdf", "image/png", "image/tiff"));
++
++    @Override
++    public void assessAndWrite(Context ctx, Item item)
++            throws SQLException, IOException, AuthorizeException {
++
++        Map<String, Integer> dims = new LinkedHashMap<>();
++        dims.put("completeness", scoreCompleteness(item));
++        dims.put("licensing",    scoreLicensing(item));
++        dims.put("openness",     scoreOpenness(ctx, item));
++        dims.put("provenance",   scoreProvenance(item));
++
++        int score = (int) Math.round(
++                dims.values().stream().mapToInt(Integer::intValue).average().orElse(0));
++        String grade = letterGrade(score);
++        String fingerprint = computeFingerprint(ctx, item);
++
++        // Clear the whole nutrition schema first so re-runs don't stack values.
++        itemService.clearMetadata(ctx, item, "nutrition", Item.ANY, Item.ANY, Item.ANY);
++        itemService.addMetadata(ctx, item, "nutrition", "score", null, null, String.valueOf(score));
++        itemService.addMetadata(ctx, item, "nutrition", "grade", null, null, grade);
++        itemService.addMetadata(ctx, item, "nutrition", "completeness", null, null,
++                String.valueOf(dims.get("completeness")));
++        itemService.addMetadata(ctx, item, "nutrition", "report", null, null,
++                mapper.writeValueAsString(dims));
++        itemService.addMetadata(ctx, item, "nutrition", "assessed", null, null, Instant.now().toString());
++        itemService.addMetadata(ctx, item, "nutrition", "fingerprint", null, null, fingerprint);
++        itemService.update(ctx, item);
++    }
++
++    @Override
++    public String computeFingerprint(Context ctx, Item item) throws SQLException {
++        StringBuilder sb = new StringBuilder();
++
++        // 1. Every metadata value EXCEPT the nutrition schema, in a stable order.
++        itemService.getMetadata(item, Item.ANY, Item.ANY, Item.ANY, Item.ANY).stream()
++                .filter(v -> !"nutrition".equals(v.getMetadataField().getMetadataSchema().getName()))
++                .map(v -> {
++                    MetadataField f = v.getMetadataField();
++                    String key = f.getMetadataSchema().getName() + "." + f.getElement()
++                            + (f.getQualifier() != null ? "." + f.getQualifier() : "");
++                    return key + "=" + v.getValue();
++                })
++                .sorted()
++                .forEach(s -> sb.append(s).append('\n'));
++
++        // 2. Bitstream formats/sizes in ORIGINAL, so a file swap also invalidates the label.
++        for (Bundle b : item.getBundles("ORIGINAL")) {
++            for (Bitstream bs : b.getBitstreams()) {
++                sb.append("bs:").append(bs.getFormat(ctx).getMIMEType())
++                        .append(':').append(bs.getSizeBytes()).append('\n');
++            }
++        }
++        return DigestUtils.sha256Hex(sb.toString());
++    }
++
++    // ---- Scoring dimensions (0-100 each) ------------------------------------------------
++
++    /** Required + recommended Dublin Core fields present. */
++    private int scoreCompleteness(Item item) {
++        String[] required = {"dc.title", "dc.contributor.author", "dc.date.issued", "dc.type"};
++        String[] recommended = {"dc.description.abstract", "dc.subject", "dc.language.iso",
++                "dc.publisher", "dc.identifier"};
++        int got = 0;
++        int total = required.length + recommended.length;
++        for (String f : required) {
++            if (hasValue(item, f)) {
++                got++;
++            }
++        }
++        for (String f : recommended) {
++            if (hasValue(item, f)) {
++                got++;
++            }
++        }
++        return (got * 100) / total;
++    }
++
++    /** A clear rights/license statement. */
++    private int scoreLicensing(Item item) {
++        return (hasValue(item, "dc.rights") || hasValue(item, "dc.rights.uri")) ? 100 : 0;
++    }
++
++    /** Share of ORIGINAL-bundle bitstreams in open/archival formats. */
++    private int scoreOpenness(Context ctx, Item item) throws SQLException {
++        int open = 0;
++        int total = 0;
++        for (Bundle b : item.getBundles("ORIGINAL")) {
++            for (Bitstream bs : b.getBitstreams()) {
++                total++;
++                if (OPEN_FORMATS.contains(bs.getFormat(ctx).getMIMEType())) {
++                    open++;
++                }
++            }
++        }
++        return total == 0 ? 0 : (open * 100) / total;
++    }
++
++    /** Persistent identifiers and funding/sponsorship provenance. */
++    private int scoreProvenance(Item item) {
++        int got = 0;
++        if (hasValue(item, "dc.identifier.uri")) {
++            got += 50;
++        }
++        if (hasValue(item, "dc.relation.funding") || hasValue(item, "dc.description.sponsorship")) {
++            got += 50;
++        }
++        return got;
++    }
++
++    // ---- Helpers ------------------------------------------------------------------------
++
++    private boolean hasValue(Item item, String field) {
++        String[] p = field.split("\\.", 3);
++        String schema = p[0];
++        String element = p[1];
++        String qualifier = (p.length == 3) ? p[2] : null;
++        List<MetadataValue> vals = itemService.getMetadata(item, schema, element, qualifier, Item.ANY);
++        return vals.stream().anyMatch(v -> v.getValue() != null && !v.getValue().isBlank());
++    }
++
++    private String letterGrade(int s) {
++        if (s >= 90) {
++            return "A";
++        }
++        if (s >= 75) {
++            return "B";
++        }
++        if (s >= 60) {
++            return "C";
++        }
++        if (s >= 40) {
++            return "D";
++        }
++        return "F";
++    }
++}
+diff --git a/dspace/config/modules/curate.cfg b/dspace/config/modules/curate.cfg
+index 6e75738..7ba2fc0 100644
+--- a/dspace/config/modules/curate.cfg
++++ b/dspace/config/modules/curate.cfg
+@@ -16,6 +16,8 @@ plugin.named.org.dspace.curate.CurationTask = org.dspace.ctask.general.RequiredM
+ plugin.named.org.dspace.curate.CurationTask = org.dspace.ctask.general.MetadataValueLinkChecker = checklinks
+ plugin.named.org.dspace.curate.CurationTask = org.dspace.ctask.general.RegisterDOI = registerdoi
+ #plugin.named.org.dspace.curate.CurationTask = org.dspace.ctask.general.CitationPage = citationpage
++# Data Nutrition Label - manual/batch only (dspace curate -t datanutrition ...); NOT in workflow-curation.xml
++plugin.named.org.dspace.curate.CurationTask = org.dspace.ctask.nutrition.DataNutritionLabel = datanutrition
+ # add new tasks here (or in additional config files)
+ 
+ ## task queue implementation
+diff --git a/dspace/config/registries/nutrition-types.xml b/dspace/config/registries/nutrition-types.xml
+new file mode 100644
+index 0000000..a7d96fe
+--- /dev/null
++++ b/dspace/config/registries/nutrition-types.xml
+@@ -0,0 +1,53 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++  Data Nutrition Label metadata schema.
++
++  Load once into the registry (the registry lives in the database):
++    [dspace]/bin/dspace registry-loader -metadata [dspace]/config/registries/nutrition-types.xml
++
++  These fields are system-written by NutritionScorer; keep them out of the submission form.
++-->
++<dspace-dc-types>
++
++    <dc-schema>
++        <name>nutrition</name>
++        <namespace>http://dspace.org/namespace/nutrition/</namespace>
++    </dc-schema>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>score</element>
++        <scope_note>Overall quality score, 0-100.</scope_note>
++    </dc-type>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>grade</element>
++        <scope_note>Letter grade A-F derived from the score.</scope_note>
++    </dc-type>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>completeness</element>
++        <scope_note>Completeness sub-score, 0-100.</scope_note>
++    </dc-type>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>report</element>
++        <scope_note>JSON breakdown of all scoring dimensions.</scope_note>
++    </dc-type>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>assessed</element>
++        <scope_note>ISO-8601 timestamp of the last assessment.</scope_note>
++    </dc-type>
++
++    <dc-type>
++        <schema>nutrition</schema>
++        <element>fingerprint</element>
++        <scope_note>SHA-256 of substantive content; drives recursion-safe re-assessment.</scope_note>
++    </dc-type>
++
++</dspace-dc-types>
+diff --git a/dspace/config/spring/api/nutrition.xml b/dspace/config/spring/api/nutrition.xml
+new file mode 100644
+index 0000000..42f6ec3
+--- /dev/null
++++ b/dspace/config/spring/api/nutrition.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++  Registers NutritionScorerImpl as a Spring bean under the interface's fully-qualified
++  name, so NutritionConsumer and DataNutritionLabel can resolve it via:
++
++    DSpaceServicesFactory.getInstance().getServiceManager()
++        .getServiceByName(NutritionScorer.class.getName(), NutritionScorer.class);
++-->
++<beans xmlns="http://www.springframework.org/schema/beans"
++       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++       xsi:schemaLocation="http://www.springframework.org/schema/beans
++                           http://www.springframework.org/schema/beans/spring-beans.xsd">
++
++    <bean id="org.dspace.nutrition.NutritionScorer"
++          class="org.dspace.nutrition.NutritionScorerImpl"/>
++
++</beans>
+
+From ab4bb9f615551cbf258903f2cc78dba4940554bd Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 30 Jun 2026 17:25:47 -0500
+Subject: [PATCH backend 2/4] make data nutrition label configurable from both
+ backend and frontend
+
+(cherry picked from commit 18cad3f6e8cc5305bce8a1284305f45d69163c24)
+(cherry picked from commit 6522334ae900f5418036478ab09b0c810071d616)
+---
+ .../org/dspace/ctask/nutrition/DataNutritionLabel.java   | 8 ++++++++
+ .../java/org/dspace/nutrition/NutritionConsumer.java     | 9 +++++++++
+ dspace/config/dspace.cfg                                 | 5 +++++
+ dspace/config/modules/rest.cfg                           | 1 +
+ 4 files changed, 23 insertions(+)
+
+diff --git a/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+index 5fcae96..aa5f406 100644
+--- a/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
++++ b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+@@ -10,6 +10,7 @@ import org.dspace.core.Constants;
+ import org.dspace.curate.AbstractCurationTask;
+ import org.dspace.curate.Curator;
+ import org.dspace.nutrition.NutritionScorer;
++import org.dspace.services.ConfigurationService;
+ import org.dspace.services.factory.DSpaceServicesFactory;
+ 
+ /**
+@@ -27,10 +28,13 @@ import org.dspace.services.factory.DSpaceServicesFactory;
+ public class DataNutritionLabel extends AbstractCurationTask {
+ 
+     private NutritionScorer scorer;
++    private boolean enabled;
+ 
+     @Override
+     public void init(Curator curator, String taskId) throws IOException {
+         super.init(curator, taskId);
++        ConfigurationService configurationService = DSpaceServicesFactory.getInstance().getConfigurationService();
++        this.enabled = configurationService.getBooleanProperty("nutrition.label.enable", true);
+         // Tasks aren't Spring beans, so pull the service from the container by name.
+         this.scorer = DSpaceServicesFactory.getInstance().getServiceManager()
+                 .getServiceByName(NutritionScorer.class.getName(), NutritionScorer.class);
+@@ -38,6 +42,10 @@ public class DataNutritionLabel extends AbstractCurationTask {
+ 
+     @Override
+     public int perform(DSpaceObject dso) throws IOException {
++        if (!enabled) {
++            setResult("Data Nutrition Label is disabled (nutrition.label.enable = false); skipped.");
++            return Curator.CURATE_SKIP;
++        }
+         if (dso.getType() != Constants.ITEM) {
+             setResult("Data Nutrition Label applies to items only; skipped.");
+             return Curator.CURATE_SKIP;
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+index 5b65b37..4f3d1f9 100644
+--- a/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+@@ -13,6 +13,7 @@ import org.dspace.core.Constants;
+ import org.dspace.core.Context;
+ import org.dspace.event.Consumer;
+ import org.dspace.event.Event;
++import org.dspace.services.ConfigurationService;
+ import org.dspace.services.factory.DSpaceServicesFactory;
+ import org.dspace.workflow.WorkflowItemService;
+ import org.dspace.workflow.factory.WorkflowServiceFactory;
+@@ -40,6 +41,9 @@ public class NutritionConsumer implements Consumer {
+     private WorkflowItemService workflowItemService;
+     private NutritionScorer scorer;
+ 
++    // Master on/off switch (nutrition.label.enable). When false the consumer is inert.
++    private boolean enabled;
++
+     // Per-transaction work list. Populated in consume(), drained in end().
+     // Matches DSpace core consumers (e.g. IndexEventConsumer), which use plain
+     // instance fields reset each transaction.
+@@ -47,6 +51,8 @@ public class NutritionConsumer implements Consumer {
+ 
+     @Override
+     public void initialize() throws Exception {
++        ConfigurationService configurationService = DSpaceServicesFactory.getInstance().getConfigurationService();
++        enabled = configurationService.getBooleanProperty("nutrition.label.enable", true);
+         itemService = ContentServiceFactory.getInstance().getItemService();
+         workspaceItemService = ContentServiceFactory.getInstance().getWorkspaceItemService();
+         workflowItemService = WorkflowServiceFactory.getInstance().getWorkflowItemService();
+@@ -57,6 +63,9 @@ public class NutritionConsumer implements Consumer {
+ 
+     @Override
+     public void consume(Context ctx, Event event) throws Exception {
++        if (!enabled) {
++            return;                              // feature switched off via nutrition.label.enable
++        }
+         if (toProcess == null) {
+             toProcess = new HashSet<>();
+         }
+diff --git a/dspace/config/dspace.cfg b/dspace/config/dspace.cfg
+index 8c69981..ffe0869 100644
+--- a/dspace/config/dspace.cfg
++++ b/dspace/config/dspace.cfg
+@@ -793,6 +793,11 @@ event.dispatcher.default.class = org.dspace.event.BasicDispatcher
+ # Add orcidqueue here, if the integration with ORCID is configured and wish to enable the synchronization queue functionality
+ event.dispatcher.default.consumers = versioning, discovery, eperson, qaeventsdelete, ldnmessage
+ 
++# Data Nutrition Label master switch. When false, the NutritionConsumer and the
++# 'datanutrition' curation task become inert (no scoring at archival/edit, no manual runs),
++# and the UI hides the label. Default true; override in local.cfg to disable.
++nutrition.label.enable = true
++
+ # The noindex dispatcher will not create search or browse indexes (useful for batch item imports)
+ event.dispatcher.noindex.class = org.dspace.event.BasicDispatcher
+ event.dispatcher.noindex.consumers = eperson
+diff --git a/dspace/config/modules/rest.cfg b/dspace/config/modules/rest.cfg
+index 2cbe1b3..011f050 100644
+--- a/dspace/config/modules/rest.cfg
++++ b/dspace/config/modules/rest.cfg
+@@ -68,3 +68,4 @@ rest.properties.exposed = matomo.enabled
+ rest.properties.exposed = matomo.request.siteid
+ rest.properties.exposed = matomo.tracker.url
+ rest.properties.exposed = bulkedit.export.max.items
++rest.properties.exposed = nutrition.label.enable
+
+From b8b4dca28b6db90d3299e6670aa12a71e220003d Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 28 Jul 2026 05:57:09 -0500
+Subject: [PATCH backend 3/4] add license headers and fix checkstyle
+ indentation in nutrition sources
+
+The nutrition classes were ported without the DSpace license header and with
+an array-initializer continuation indent checkstyle rejects, which failed
+license:check and checkstyle:check during 'mvn package'.
+
+(cherry picked from commit 6f8adbbe9f810dd02b79b18f79d3a61ee1a29d4d)
+---
+ .../org/dspace/ctask/nutrition/DataNutritionLabel.java   | 7 +++++++
+ .../java/org/dspace/nutrition/NutritionConsumer.java     | 7 +++++++
+ .../main/java/org/dspace/nutrition/NutritionScorer.java  | 7 +++++++
+ .../java/org/dspace/nutrition/NutritionScorerImpl.java   | 9 ++++++++-
+ 4 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+index aa5f406..88fc7a4 100644
+--- a/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
++++ b/dspace-api/src/main/java/org/dspace/ctask/nutrition/DataNutritionLabel.java
+@@ -1,3 +1,10 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
+ package org.dspace.ctask.nutrition;
+ 
+ import java.io.IOException;
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+index 4f3d1f9..5c7e4f3 100644
+--- a/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionConsumer.java
+@@ -1,3 +1,10 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
+ package org.dspace.nutrition;
+ 
+ import java.sql.SQLException;
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
+index 5cded5c..836757d 100644
+--- a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorer.java
+@@ -1,3 +1,10 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
+ package org.dspace.nutrition;
+ 
+ import java.io.IOException;
+diff --git a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
+index e8e1c5d..abe161d 100644
+--- a/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
++++ b/dspace-api/src/main/java/org/dspace/nutrition/NutritionScorerImpl.java
+@@ -1,3 +1,10 @@
++/**
++ * The contents of this file are subject to the license and copyright
++ * detailed in the LICENSE and NOTICE files at the root of the source
++ * tree and available online at
++ *
++ * http://www.dspace.org/license/
++ */
+ package org.dspace.nutrition;
+ 
+ import java.io.IOException;
+@@ -100,7 +107,7 @@ public class NutritionScorerImpl implements NutritionScorer {
+     private int scoreCompleteness(Item item) {
+         String[] required = {"dc.title", "dc.contributor.author", "dc.date.issued", "dc.type"};
+         String[] recommended = {"dc.description.abstract", "dc.subject", "dc.language.iso",
+-                "dc.publisher", "dc.identifier"};
++                                "dc.publisher", "dc.identifier"};
+         int got = 0;
+         int total = required.length + recommended.length;
+         for (String f : required) {
+
+From 121fcbe5a6b662e1dcdc37ba102cec7c3a824bc6 Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Fri, 24 Jul 2026 21:30:15 -0500
+Subject: [PATCH backend 4/4] register the NutritionConsumer and enable it in
+ the default dispatcher
+
+Declare event.consumer.nutrition.{class,filters} and add 'nutrition' to
+event.dispatcher.default.consumers, and document that a local.cfg which
+overrides the consumer list must add 'nutrition' itself.
+
+(split out of commit 903bc927e24ec249d78b519f822c0eed94fe79c8)
+---
+ dspace/config/dspace.cfg | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/dspace/config/dspace.cfg b/dspace/config/dspace.cfg
+index ffe0869..b394796 100644
+--- a/dspace/config/dspace.cfg
++++ b/dspace/config/dspace.cfg
+@@ -791,11 +791,14 @@ event.dispatcher.default.class = org.dspace.event.BasicDispatcher
+ # Add rdf here, if you are using dspace-rdf to export your repository content as RDF.
+ # Add iiif here, if you are using dspace-iiif.
+ # Add orcidqueue here, if the integration with ORCID is configured and wish to enable the synchronization queue functionality
+-event.dispatcher.default.consumers = versioning, discovery, eperson, qaeventsdelete, ldnmessage
++event.dispatcher.default.consumers = versioning, discovery, eperson, qaeventsdelete, ldnmessage, nutrition
+ 
+ # Data Nutrition Label master switch. When false, the NutritionConsumer and the
+ # 'datanutrition' curation task become inert (no scoring at archival/edit, no manual runs),
+ # and the UI hides the label. Default true; override in local.cfg to disable.
++# Prefer this switch over removing 'nutrition' from the dispatcher list above: any local.cfg
++# that overrides event.dispatcher.default.consumers replaces this line wholesale, so a site
++# maintaining its own consumer list must add 'nutrition' to it explicitly.
+ nutrition.label.enable = true
+ 
+ # The noindex dispatcher will not create search or browse indexes (useful for batch item imports)
+@@ -846,6 +849,13 @@ event.consumer.orcidqueue.filters = Item+Install|Modify|Modify_Metadata|Delete|R
+ event.consumer.ldnmessage.class = org.dspace.app.ldn.LDNMessageConsumer
+ event.consumer.ldnmessage.filters = Item+Install
+ 
++# Data Nutrition Label consumer: scores an item once at archival (Install) and re-scores it on
++# any substantive edit afterwards. Non-archived and in-workflow items are skipped by the
++# consumer itself, and its own metadata write cannot re-trigger it (content fingerprint guard).
++# Governed by nutrition.label.enable above.
++event.consumer.nutrition.class = org.dspace.nutrition.NutritionConsumer
++event.consumer.nutrition.filters = Item+Install|Modify|Modify_Metadata|Add|Remove
++
+ # item submission config reload consumer
+ # This consumer can be useful for reloading changes made in the item-submission.xml config file,
+ # without restarting Tomcat, primarily for adding new collection mappings.
+From 66470795d72a8a9bd6321c2103ffa98942450db5 Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 28 Jul 2026 04:03:06 -0500
+Subject: [PATCH angular 1/4] display nutrition label on item page
+
+(cherry picked from commit d6d41380e9beb996621c70931181c0ad01f62508)
+---
+ src/assets/i18n/en.json5                      |  14 +++
+ .../nutrition-label.component.html            |  31 +++++
+ .../nutrition-label.component.scss            | 106 ++++++++++++++++
+ .../nutrition-label.component.ts              |  57 +++++++++
+ .../untyped-item/untyped-item.component.html  | 113 ++++++++++++++++++
+ .../untyped-item/untyped-item.component.ts    |  66 ++++++++++
+ src/themes/dspace/eager-theme.module.ts       |   2 +
+ 7 files changed, 389 insertions(+)
+ create mode 100644 src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
+ create mode 100644 src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.scss
+ create mode 100644 src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
+ create mode 100644 src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.html
+ create mode 100644 src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.ts
+
+diff --git a/src/assets/i18n/en.json5 b/src/assets/i18n/en.json5
+index c0b620d..c7d1021 100644
+--- a/src/assets/i18n/en.json5
++++ b/src/assets/i18n/en.json5
+@@ -1707,6 +1707,8 @@
+ 
+   "curation-task.task.registerdoi.label": "Register DOI",
+ 
++  "curation-task.task.datanutrition.label": "Data Nutrition",
++
+   "curation.form.task-select.label": "Task:",
+ 
+   "curation.form.submit": "Start",
+@@ -2831,6 +2833,18 @@
+ 
+   "item.page.publisher": "Publisher",
+ 
++  "item.page.nutrition.title": "Data Nutrition Label",
++
++  "item.page.nutrition.assessed": "Assessed",
++
++  "item.page.nutrition.dimension.completeness": "Completeness",
++
++  "item.page.nutrition.dimension.licensing": "Licensing",
++
++  "item.page.nutrition.dimension.openness": "Openness",
++
++  "item.page.nutrition.dimension.provenance": "Provenance",
++
+   "item.page.titleprefix": "Item: ",
+ 
+   "item.page.volume-title": "Volume Title",
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
+new file mode 100644
+index 0000000..45cde89
+--- /dev/null
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
+@@ -0,0 +1,31 @@
++@if (grade) {
++  <div class="nutrition-label" [attr.data-grade]="grade">
++    <div class="nutrition-label-header">
++      <span class="nutrition-grade" [attr.data-grade]="grade">{{ grade }}</span>
++      <div class="nutrition-headline">
++        <span class="nutrition-title">{{ 'item.page.nutrition.title' | translate }}</span>
++        <span class="nutrition-score">{{ score }}<span class="nutrition-score-max">/100</span></span>
++      </div>
++    </div>
++
++    @if (dimensions.length > 0) {
++      <ul class="nutrition-dims list-unstyled">
++        @for (dim of dimensions; track dim.key) {
++          <li class="nutrition-dim">
++            <span class="nutrition-dim-label">{{ ('item.page.nutrition.dimension.' + dim.key) | translate }}</span>
++            <span class="nutrition-dim-bar" role="presentation">
++              <span class="nutrition-dim-fill" [style.width.%]="dim.value"></span>
++            </span>
++            <span class="nutrition-dim-value">{{ dim.value }}</span>
++          </li>
++        }
++      </ul>
++    }
++
++    @if (assessed) {
++      <div class="nutrition-assessed">
++        {{ 'item.page.nutrition.assessed' | translate }} {{ assessed | date: 'mediumDate' }}
++      </div>
++    }
++  </div>
++}
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.scss b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.scss
+new file mode 100644
+index 0000000..3edf621
+--- /dev/null
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.scss
+@@ -0,0 +1,106 @@
++// Compact, visually distinct "Data Nutrition Label" card for the item sidebar.
++// The A–F colour scale is keyed off [data-grade] so the same value drives the
++// accent border and the grade chip.
++
++.nutrition-label {
++  --nutrition-color: var(--bs-secondary);
++
++  border: 1px solid var(--bs-border-color);
++  border-left: 4px solid var(--nutrition-color);
++  border-radius: var(--bs-border-radius, 0.375rem);
++  padding: 0.6rem 0.75rem;
++  margin-bottom: 1rem;
++  background: var(--bs-tertiary-bg, #f8f9fa);
++
++  &[data-grade='A'] { --nutrition-color: #1a7f37; }
++  &[data-grade='B'] { --nutrition-color: #57a639; }
++  &[data-grade='C'] { --nutrition-color: #d4a017; }
++  &[data-grade='D'] { --nutrition-color: #e8590c; }
++  &[data-grade='F'] { --nutrition-color: #c92a2a; }
++}
++
++.nutrition-label-header {
++  display: flex;
++  align-items: center;
++  gap: 0.6rem;
++}
++
++.nutrition-grade {
++  flex: 0 0 auto;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 2.25rem;
++  height: 2.25rem;
++  border-radius: 50%;
++  background: var(--nutrition-color);
++  color: #fff;
++  font-size: 1.25rem;
++  font-weight: 700;
++  line-height: 1;
++}
++
++.nutrition-headline {
++  display: flex;
++  flex-direction: column;
++  line-height: 1.2;
++}
++
++.nutrition-title {
++  font-weight: 600;
++  font-size: 0.95rem;
++}
++
++.nutrition-score {
++  font-size: 0.85rem;
++  color: var(--bs-secondary-color, #6c757d);
++}
++
++.nutrition-score-max {
++  opacity: 0.7;
++}
++
++.nutrition-dims {
++  margin: 0.55rem 0 0;
++  display: grid;
++  gap: 0.3rem;
++}
++
++.nutrition-dim {
++  display: grid;
++  grid-template-columns: minmax(5.5rem, auto) 1fr 2ch;
++  align-items: center;
++  gap: 0.4rem;
++  font-size: 0.8rem;
++}
++
++.nutrition-dim-label {
++  text-transform: capitalize;
++  color: var(--bs-body-color);
++}
++
++.nutrition-dim-bar {
++  height: 0.4rem;
++  border-radius: 0.4rem;
++  background: var(--bs-border-color, #dee2e6);
++  overflow: hidden;
++}
++
++.nutrition-dim-fill {
++  display: block;
++  height: 100%;
++  border-radius: inherit;
++  background: var(--nutrition-color);
++}
++
++.nutrition-dim-value {
++  text-align: right;
++  font-variant-numeric: tabular-nums;
++  color: var(--bs-secondary-color, #6c757d);
++}
++
++.nutrition-assessed {
++  margin-top: 0.5rem;
++  font-size: 0.7rem;
++  color: var(--bs-secondary-color, #6c757d);
++}
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
+new file mode 100644
+index 0000000..1ab5c43
+--- /dev/null
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
+@@ -0,0 +1,57 @@
++import { DatePipe } from '@angular/common';
++import {
++  ChangeDetectionStrategy,
++  Component,
++  Input,
++  OnInit,
++} from '@angular/core';
++import { TranslateModule } from '@ngx-translate/core';
++
++import { Item } from '../../../../../../../../app/core/shared/item.model';
++
++interface NutritionDimension {
++  key: string;
++  value: number;
++}
++
++/**
++ * Compact "Data Nutrition Label" for the item page: a colour-coded grade chip plus a
++ * small breakdown of the scoring dimensions. Reads the nutrition.* metadata written by the
++ * backend NutritionScorer; renders nothing when an item has not been assessed.
++ */
++@Component({
++  selector: 'ds-nutrition-label',
++  styleUrls: ['./nutrition-label.component.scss'],
++  templateUrl: './nutrition-label.component.html',
++  changeDetection: ChangeDetectionStrategy.OnPush,
++  imports: [
++    DatePipe,
++    TranslateModule,
++  ],
++})
++export class NutritionLabelComponent implements OnInit {
++
++  @Input() item: Item;
++
++  grade: string;
++  score: string;
++  assessed: string;
++  dimensions: NutritionDimension[] = [];
++
++  ngOnInit(): void {
++    this.grade = this.item?.firstMetadataValue('nutrition.grade');
++    this.score = this.item?.firstMetadataValue('nutrition.score');
++    this.assessed = this.item?.firstMetadataValue('nutrition.assessed');
++
++    const report = this.item?.firstMetadataValue('nutrition.report');
++    if (report) {
++      try {
++        const parsed = JSON.parse(report);
++        this.dimensions = Object.keys(parsed)
++          .map((key) => ({ key, value: Number(parsed[key]) }));
++      } catch {
++        // leave dimensions empty if the JSON is malformed
++      }
++    }
++  }
++}
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.html b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.html
+new file mode 100644
+index 0000000..30bc415
+--- /dev/null
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.html
+@@ -0,0 +1,113 @@
++@if (showBackButton$ | async) {
++  <ds-results-back-button [back]="back"></ds-results-back-button>
++}
++@if (iiifEnabled) {
++  <div class="row">
++    <div class="col-12">
++      <ds-mirador-viewer id="iiif-viewer"
++        [object]="object"
++        [searchable]="iiifSearchEnabled"
++        [query]="iiifQuery$ | async">
++      </ds-mirador-viewer>
++    </div>
++  </div>
++}
++
++<div class="d-flex flex-row">
++  <ds-item-page-title-field [item]="object" class="me-auto">
++  </ds-item-page-title-field>
++  <ds-dso-edit-menu></ds-dso-edit-menu>
++</div>
++<div class="row">
++  <div class="col-12 col-md-4">
++    @if (!(mediaViewer.image || mediaViewer.video)) {
++      <ds-metadata-field-wrapper [hideIfNoTextContent]="false">
++        <ds-thumbnail [thumbnail]="object?.thumbnail | async"></ds-thumbnail>
++      </ds-metadata-field-wrapper>
++    }
++    @if (mediaViewer.image || mediaViewer.video) {
++      <div class="mb-2">
++        <ds-media-viewer [item]="object"></ds-media-viewer>
++      </div>
++    }
++    <ds-item-page-file-section [item]="object"></ds-item-page-file-section>
++    <ds-item-page-date-field [item]="object"></ds-item-page-date-field>
++    <ds-metadata-representation-list class="ds-item-page-mixed-author-field"
++      [parentItem]="object"
++      [itemType]="'Person'"
++      [metadataFields]="['dc.contributor.author', 'dc.creator']"
++      [label]="'item.page.authors' | translate">
++    </ds-metadata-representation-list>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['journal.title']"
++      [label]="'item.page.journal-title'">
++    </ds-generic-item-page-field>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['journal.identifier.issn']"
++      [label]="'item.page.journal-issn'">
++    </ds-generic-item-page-field>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['journalvolume.identifier.name']"
++      [label]="'item.page.volume-title'">
++    </ds-generic-item-page-field>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['dc.publisher']"
++      [label]="'item.page.publisher'">
++    </ds-generic-item-page-field>
++    <ds-nutrition-label [item]="object"></ds-nutrition-label>
++  </div>
++  <div class="col-12 col-md-6">
++    <ds-item-page-abstract-field [item]="object"></ds-item-page-abstract-field>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['dc.description']"
++      [label]="'item.page.description'">
++    </ds-generic-item-page-field>
++
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['dc.subject']"
++      [separator]="', '"
++      [label]="'item.page.subject'">
++    </ds-generic-item-page-field>
++    <ds-generic-item-page-field [item]="object"
++      [fields]="['dc.identifier.citation']"
++      [label]="'item.page.citation'">
++    </ds-generic-item-page-field>
++    @if (geospatialItemPageFieldsEnabled) {
++      <ds-geospatial-item-page-field [item]="object"
++                                     [label]="'item.page.places'"
++                                     [pointFields]="['dcterms.spatial']"
++                                     [bboxFields]="['dcterms.spatial']"
++                                     [cluster]="true"
++      >
++      </ds-geospatial-item-page-field>
++    }
++    <ds-item-page-uri-field [item]="object"
++      [fields]="['dc.identifier.uri']"
++      [label]="'item.page.uri'">
++    </ds-item-page-uri-field>
++    <ds-item-page-collections [item]="object"></ds-item-page-collections>
++    <ds-item-page-uri-field [item]="object"
++      [fields]="['coar.notify.endorsedBy']"
++      [label]="'item.page.endorsement'">
++    </ds-item-page-uri-field>
++    <ds-item-page-uri-field [item]="object"
++      [fields]="['datacite.relation.isReviewedBy']"
++      [label]="'item.page.review'">
++    </ds-item-page-uri-field>
++    <ds-item-page-uri-field [item]="object"
++      [fields]="['datacite.relation.isSupplementedBy']"
++      [label]="'item.page.supplemented'">
++    </ds-item-page-uri-field>
++    <ds-item-page-uri-field [item]="object"
++      [fields]="['datacite.relation.isReferencedBy']"
++      [label]="'item.page.referenced'">
++    </ds-item-page-uri-field>
++    <ds-item-page-cc-license-field [item]="object" [variant]="'full'">
++    </ds-item-page-cc-license-field>
++    <div>
++      <a class="btn btn-outline-primary" [routerLink]="[itemPageRoute + '/full']" role="button" role="button" tabindex="0">
++        <i class="fas fa-info-circle"></i> {{"item.page.link.full" | translate}}
++      </a>
++    </div>
++  </div>
++</div>
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.ts b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.ts
+new file mode 100644
+index 0000000..db65982
+--- /dev/null
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/untyped-item.component.ts
+@@ -0,0 +1,66 @@
++import { AsyncPipe } from '@angular/common';
++import {
++  ChangeDetectionStrategy,
++  Component,
++} from '@angular/core';
++import { RouterLink } from '@angular/router';
++import { TranslateModule } from '@ngx-translate/core';
++
++import { Context } from '../../../../../../../app/core/shared/context.model';
++import { Item } from '../../../../../../../app/core/shared/item.model';
++import { ViewMode } from '../../../../../../../app/core/shared/view-mode.model';
++import { CollectionsComponent } from '../../../../../../../app/item-page/field-components/collections/collections.component';
++import { ThemedMediaViewerComponent } from '../../../../../../../app/item-page/media-viewer/themed-media-viewer.component';
++import { MiradorViewerComponent } from '../../../../../../../app/item-page/mirador-viewer/mirador-viewer.component';
++import { ThemedFileSectionComponent } from '../../../../../../../app/item-page/simple/field-components/file-section/themed-file-section.component';
++import { ItemPageAbstractFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/abstract/item-page-abstract-field.component';
++import { ItemPageCcLicenseFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/cc-license/item-page-cc-license-field.component';
++import { ItemPageDateFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/date/item-page-date-field.component';
++import { GenericItemPageFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/generic/generic-item-page-field.component';
++import { GeospatialItemPageFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/geospatial/geospatial-item-page-field.component';
++import { ThemedItemPageTitleFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/title/themed-item-page-field.component';
++import { ItemPageUriFieldComponent } from '../../../../../../../app/item-page/simple/field-components/specific-field/uri/item-page-uri-field.component';
++import { UntypedItemComponent as BaseComponent } from '../../../../../../../app/item-page/simple/item-types/untyped-item/untyped-item.component';
++import { ThemedMetadataRepresentationListComponent } from '../../../../../../../app/item-page/simple/metadata-representation-list/themed-metadata-representation-list.component';
++import { DsoEditMenuComponent } from '../../../../../../../app/shared/dso-page/dso-edit-menu/dso-edit-menu.component';
++import { MetadataFieldWrapperComponent } from '../../../../../../../app/shared/metadata-field-wrapper/metadata-field-wrapper.component';
++import { listableObjectComponent } from '../../../../../../../app/shared/object-collection/shared/listable-object/listable-object.decorator';
++import { ThemedResultsBackButtonComponent } from '../../../../../../../app/shared/results-back-button/themed-results-back-button.component';
++import { ThemedThumbnailComponent } from '../../../../../../../app/thumbnail/themed-thumbnail.component';
++import { NutritionLabelComponent } from './nutrition-label/nutrition-label.component';
++
++@listableObjectComponent(Item, ViewMode.StandalonePage, Context.Any, 'dspace')
++@Component({
++  selector: 'ds-untyped-item',
++  // styleUrls: ['./untyped-item.component.scss'],
++  styleUrls: [
++    '../../../../../../../app/item-page/simple/item-types/untyped-item/untyped-item.component.scss',
++  ],
++  templateUrl: './untyped-item.component.html',
++  // templateUrl: '../../../../../../../app/item-page/simple/item-types/untyped-item/untyped-item.component.html',
++  changeDetection: ChangeDetectionStrategy.OnPush,
++  imports: [
++    AsyncPipe,
++    CollectionsComponent,
++    DsoEditMenuComponent,
++    GenericItemPageFieldComponent,
++    GeospatialItemPageFieldComponent,
++    ItemPageAbstractFieldComponent,
++    ItemPageCcLicenseFieldComponent,
++    ItemPageDateFieldComponent,
++    ItemPageUriFieldComponent,
++    MetadataFieldWrapperComponent,
++    MiradorViewerComponent,
++    NutritionLabelComponent,
++    RouterLink,
++    ThemedFileSectionComponent,
++    ThemedItemPageTitleFieldComponent,
++    ThemedMediaViewerComponent,
++    ThemedMetadataRepresentationListComponent,
++    ThemedResultsBackButtonComponent,
++    ThemedThumbnailComponent,
++    TranslateModule,
++  ],
++})
++export class UntypedItemComponent extends BaseComponent {
++}
+diff --git a/src/themes/dspace/eager-theme.module.ts b/src/themes/dspace/eager-theme.module.ts
+index 233b08c..b6d185b 100644
+--- a/src/themes/dspace/eager-theme.module.ts
++++ b/src/themes/dspace/eager-theme.module.ts
+@@ -5,6 +5,7 @@ import { RootModule } from '../../app/root.module';
+ import { HeaderComponent } from './app/header/header.component';
+ import { HeaderNavbarWrapperComponent } from './app/header-nav-wrapper/header-navbar-wrapper.component';
+ import { HomeNewsComponent } from './app/home-page/home-news/home-news.component';
++import { UntypedItemComponent } from './app/item-page/simple/item-types/untyped-item/untyped-item.component';
+ import { NavbarComponent } from './app/navbar/navbar.component';
+ 
+ /**
+@@ -19,6 +20,7 @@ const DECLARATIONS = [
+   HeaderComponent,
+   HeaderNavbarWrapperComponent,
+   NavbarComponent,
++  UntypedItemComponent,
+ ];
+ 
+ @NgModule({
+
+From 6f39af55835e0cf3cacd9d31daec836495c933fc Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 30 Jun 2026 17:25:15 -0500
+Subject: [PATCH angular 2/4] make data nutrition label configurable from both
+ backend and frontend
+
+(cherry picked from commit b5f83d65606b26fbfb4bcec1124690a028698d06)
+(cherry picked from commit 5577e5985e5f59d09e2066439ded7af194f555ae)
+(cherry picked from commit 3ad6a66541efcbc9648065e40aabfbb9f868880a)
+---
+ .../config/nutrition-label-config.service.ts  | 45 +++++++++++++++++++
+ .../curation-form/curation-form.component.ts  | 14 ++++--
+ .../full/full-item-page.component.ts          | 29 ++++++++++--
+ .../nutrition-label.component.html            |  2 +-
+ .../nutrition-label.component.ts              | 18 +++++++-
+ 5 files changed, 98 insertions(+), 10 deletions(-)
+ create mode 100644 src/app/core/config/nutrition-label-config.service.ts
+
+diff --git a/src/app/core/config/nutrition-label-config.service.ts b/src/app/core/config/nutrition-label-config.service.ts
+new file mode 100644
+index 0000000..caeb5bc
+--- /dev/null
++++ b/src/app/core/config/nutrition-label-config.service.ts
+@@ -0,0 +1,45 @@
++import { Injectable } from '@angular/core';
++import {
++  map,
++  Observable,
++} from 'rxjs';
++
++import { ConfigurationDataService } from '../data/configuration-data.service';
++import { RemoteData } from '../data/remote-data';
++import { ConfigurationProperty } from '../shared/configuration-property.model';
++import { getFirstCompletedRemoteData } from '../shared/operators';
++
++/**
++ * Reads the backend Data Nutrition Label master switch (nutrition.label.enable) so the UI can
++ * mirror it: hide the item-page badge, drop the full-item-page nutrition.* rows, and remove the
++ * 'datanutrition' option from the curation-task dropdown when the feature is turned off.
++ *
++ * The property is exposed through rest.properties.exposed. It defaults to enabled when the
++ * property is absent or not readable, matching the backend default (true).
++ */
++@Injectable({
++  providedIn: 'root',
++})
++export class NutritionLabelConfigService {
++
++  static readonly PROPERTY = 'nutrition.label.enable';
++
++  /** Curation-task short name registered for the Data Nutrition Label task. */
++  static readonly TASK_NAME = 'datanutrition';
++
++  constructor(
++    private configService: ConfigurationDataService,
++  ) {
++  }
++
++  /**
++   * Whether the Data Nutrition Label feature is enabled on the backend.
++   */
++  isEnabled(): Observable<boolean> {
++    return this.configService.findByPropertyName(NutritionLabelConfigService.PROPERTY).pipe(
++      getFirstCompletedRemoteData(),
++      map((rd: RemoteData<ConfigurationProperty>) =>
++        !rd.hasSucceeded || rd.payload?.values?.[0] !== 'false'),
++    );
++  }
++}
+diff --git a/src/app/curation-form/curation-form.component.ts b/src/app/curation-form/curation-form.component.ts
+index 494e9e5..2a88189 100644
+--- a/src/app/curation-form/curation-form.component.ts
++++ b/src/app/curation-form/curation-form.component.ts
+@@ -18,11 +18,13 @@ import {
+   TranslateService,
+ } from '@ngx-translate/core';
+ import {
++  combineLatest,
+   Observable,
+   Subscription,
+ } from 'rxjs';
+ import { map } from 'rxjs/operators';
+ 
++import { NutritionLabelConfigService } from '../core/config/nutrition-label-config.service';
+ import { ConfigurationDataService } from '../core/data/configuration-data.service';
+ import { ScriptDataService } from '../core/data/processes/script-data.service';
+ import { RemoteData } from '../core/data/remote-data';
+@@ -69,6 +71,7 @@ export class CurationFormComponent implements OnDestroy, OnInit {
+   constructor(
+     private scriptDataService: ScriptDataService,
+     private configurationDataService: ConfigurationDataService,
++    private nutritionLabelConfigService: NutritionLabelConfigService,
+     private notificationsService: NotificationsService,
+     private translateService: TranslateService,
+     private handleService: HandleService,
+@@ -88,12 +91,15 @@ export class CurationFormComponent implements OnDestroy, OnInit {
+     });
+ 
+     this.config = this.configurationDataService.findByPropertyName(CURATION_CFG);
+-    this.subs.push(this.config.pipe(
+-      getFirstSucceededRemoteDataPayload(),
+-    ).subscribe((configProperties: ConfigurationProperty) => {
++    this.subs.push(combineLatest([
++      this.config.pipe(getFirstSucceededRemoteDataPayload()),
++      this.nutritionLabelConfigService.isEnabled(),
++    ]).subscribe(([configProperties, nutritionEnabled]: [ConfigurationProperty, boolean]) => {
+       this.tasks = configProperties.values
+         .filter((value) => isNotEmpty(value) && value.includes('='))
+-        .map((value) => value.split('=')[1].trim());
++        .map((value) => value.split('=')[1].trim())
++        // Hide the Data Nutrition Label task when the feature is switched off on the backend.
++        .filter((task) => nutritionEnabled || task !== NutritionLabelConfigService.TASK_NAME);
+       this.form.get('task').patchValue(this.tasks[0]);
+       this.cdr.detectChanges();
+     }));
+diff --git a/src/app/item-page/full/full-item-page.component.ts b/src/app/item-page/full/full-item-page.component.ts
+index 5042d3a..7afc45f 100644
+--- a/src/app/item-page/full/full-item-page.component.ts
++++ b/src/app/item-page/full/full-item-page.component.ts
+@@ -20,6 +20,7 @@ import {
+ import { TranslateModule } from '@ngx-translate/core';
+ import {
+   BehaviorSubject,
++  combineLatest,
+   Observable,
+ } from 'rxjs';
+ import {
+@@ -28,6 +29,7 @@ import {
+ } from 'rxjs/operators';
+ 
+ import { NotifyInfoService } from '../../core/coar-notify/notify-info/notify-info.service';
++import { NutritionLabelConfigService } from '../../core/config/nutrition-label-config.service';
+ import { AuthorizationDataService } from '../../core/data/feature-authorization/authorization-data.service';
+ import { ItemDataService } from '../../core/data/item-data.service';
+ import { RemoteData } from '../../core/data/remote-data';
+@@ -101,6 +103,7 @@ export class FullItemPageComponent extends ItemPageComponent implements OnInit,
+     protected signpostingDataService: SignpostingDataService,
+     protected linkHeadService: LinkHeadService,
+     protected notifyInfoService: NotifyInfoService,
++    protected nutritionLabelConfigService: NutritionLabelConfigService,
+     @Inject(PLATFORM_ID) protected platformId: string,
+   ) {
+     super(route, router, items, authorizationService, responseService, signpostingDataService, linkHeadService, notifyInfoService, platformId);
+@@ -109,10 +112,17 @@ export class FullItemPageComponent extends ItemPageComponent implements OnInit,
+   /*** AoT inheritance fix, will hopefully be resolved in the near future **/
+   ngOnInit(): void {
+     super.ngOnInit();
+-    this.metadata$ = this.itemRD$.pipe(
+-      map((rd: RemoteData<Item>) => rd.payload),
+-      filter((item: Item) => hasValue(item)),
+-      map((item: Item) => item.metadata));
++    this.metadata$ = combineLatest([
++      this.itemRD$.pipe(
++        map((rd: RemoteData<Item>) => rd.payload),
++        filter((item: Item) => hasValue(item)),
++        map((item: Item) => item.metadata)),
++      this.nutritionLabelConfigService.isEnabled(),
++    ]).pipe(
++      // When the Data Nutrition Label feature is off, omit its nutrition.* metadata rows.
++      map(([metadata, nutritionEnabled]: [MetadataMap, boolean]) =>
++        nutritionEnabled ? metadata : this.withoutNutritionMetadata(metadata)),
++    );
+ 
+     this.subs.push(this.route.data.subscribe((data: Data) => {
+       this.fromSubmissionObject = hasValue(data.wfi) || hasValue(data.wsi);
+@@ -120,6 +130,17 @@ export class FullItemPageComponent extends ItemPageComponent implements OnInit,
+     );
+   }
+ 
++  /**
++   * Return a copy of the metadata map with all nutrition.* fields removed.
++   */
++  withoutNutritionMetadata(metadata: MetadataMap): MetadataMap {
++    const filtered: MetadataMap = new MetadataMap();
++    Object.keys(metadata)
++      .filter((key: string) => !key.startsWith('nutrition.'))
++      .forEach((key: string) => filtered[key] = metadata[key]);
++    return filtered;
++  }
++
+   /**
+    * Navigate back in browser history.
+    */
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
+index 45cde89..fc22159 100644
+--- a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.html
+@@ -1,4 +1,4 @@
+-@if (grade) {
++@if ((enabled$ | async) && grade) {
+   <div class="nutrition-label" [attr.data-grade]="grade">
+     <div class="nutrition-label-header">
+       <span class="nutrition-grade" [attr.data-grade]="grade">{{ grade }}</span>
+diff --git a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
+index 1ab5c43..71613e5 100644
+--- a/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
++++ b/src/themes/dspace/app/item-page/simple/item-types/untyped-item/nutrition-label/nutrition-label.component.ts
+@@ -1,4 +1,7 @@
+-import { DatePipe } from '@angular/common';
++import {
++  AsyncPipe,
++  DatePipe,
++} from '@angular/common';
+ import {
+   ChangeDetectionStrategy,
+   Component,
+@@ -6,7 +9,9 @@ import {
+   OnInit,
+ } from '@angular/core';
+ import { TranslateModule } from '@ngx-translate/core';
++import { Observable } from 'rxjs';
+ 
++import { NutritionLabelConfigService } from '../../../../../../../../app/core/config/nutrition-label-config.service';
+ import { Item } from '../../../../../../../../app/core/shared/item.model';
+ 
+ interface NutritionDimension {
+@@ -25,6 +30,7 @@ interface NutritionDimension {
+   templateUrl: './nutrition-label.component.html',
+   changeDetection: ChangeDetectionStrategy.OnPush,
+   imports: [
++    AsyncPipe,
+     DatePipe,
+     TranslateModule,
+   ],
+@@ -38,7 +44,17 @@ export class NutritionLabelComponent implements OnInit {
+   assessed: string;
+   dimensions: NutritionDimension[] = [];
+ 
++  /** Backend feature switch (nutrition.label.enable); the template hides the label when false. */
++  enabled$: Observable<boolean>;
++
++  constructor(
++    protected nutritionConfig: NutritionLabelConfigService,
++  ) {
++  }
++
+   ngOnInit(): void {
++    this.enabled$ = this.nutritionConfig.isEnabled();
++
+     this.grade = this.item?.firstMetadataValue('nutrition.grade');
+     this.score = this.item?.firstMetadataValue('nutrition.score');
+     this.assessed = this.item?.firstMetadataValue('nutrition.assessed');
+
+From 0b5c7d1de84ca81f099ac68222a7c2c53b0ebbc8 Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 28 Jul 2026 04:52:29 -0500
+Subject: [PATCH angular 3/4] add specs for the Data Nutrition Label
+ curation-task filtering
+
+Covers both directions of the nutrition.label.enable switch in the curation
+task dropdown. Typechecked and linted, but NOT executed: this VM has no
+Chrome binary, so Karma cannot run here.
+
+(cherry picked from commit 3119817eaaecc2a1fa15bc7ca963e47d4cc50b2e)
+---
+ .../curation-form.component.spec.ts           | 75 +++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/src/app/curation-form/curation-form.component.spec.ts b/src/app/curation-form/curation-form.component.spec.ts
+index 8ca8e5e..af7f3b4 100644
+--- a/src/app/curation-form/curation-form.component.spec.ts
++++ b/src/app/curation-form/curation-form.component.spec.ts
+@@ -174,3 +174,78 @@ describe('CurationFormComponent', () => {
+     expect(scriptDataService.invoke).not.toHaveBeenCalled();
+   }));
+ });
++
++describe('CurationFormComponent and the Data Nutrition Label switch', () => {
++  let comp: CurationFormComponent;
++  let fixture: ComponentFixture<CurationFormComponent>;
++
++  const curationTasks = Object.assign(new ConfigurationProperty(), {
++    name: 'plugin.named.org.dspace.curate.CurationTask',
++    values: [
++      'org.dspace.ctask.general.ProfileFormats = profileformats',
++      'org.dspace.ctask.nutrition.DataNutritionLabel = datanutrition',
++    ],
++  });
++
++  /**
++   * Build the component with the backend nutrition.label.enable property set to the given value.
++   */
++  function setUp(nutritionEnabled: string) {
++    const configurationDataService = jasmine.createSpyObj('configurationDataService', ['findByPropertyName']);
++    configurationDataService.findByPropertyName.and.callFake((property: string) =>
++      property === 'nutrition.label.enable'
++        ? createSuccessfulRemoteDataObject$(Object.assign(new ConfigurationProperty(), {
++          name: 'nutrition.label.enable',
++          values: [nutritionEnabled],
++        }))
++        : createSuccessfulRemoteDataObject$(curationTasks));
++
++    TestBed.configureTestingModule({
++      imports: [TranslateModule.forRoot(), FormsModule, ReactiveFormsModule, CurationFormComponent],
++      providers: [
++        {
++          provide: ScriptDataService, useValue: jasmine.createSpyObj('scriptDataService', {
++            invoke: createSuccessfulRemoteDataObject$(new Process()),
++          }),
++        },
++        {
++          provide: ProcessDataService, useValue: jasmine.createSpyObj('processDataService', {
++            findByHref: createSuccessfulRemoteDataObject$(new Process()),
++          }),
++        },
++        { provide: NotificationsService, useValue: new NotificationsServiceStub() },
++        { provide: HandleService, useValue: { normalizeHandle: (a: string) => of(a) } as any },
++        { provide: Router, useValue: new RouterStub() },
++        { provide: ConfigurationDataService, useValue: configurationDataService },
++      ],
++      schemas: [CUSTOM_ELEMENTS_SCHEMA],
++    });
++
++    fixture = TestBed.createComponent(CurationFormComponent);
++    comp = fixture.componentInstance;
++    fixture.detectChanges();
++  }
++
++  afterEach(() => {
++    TestBed.resetTestingModule();
++  });
++
++  it('should offer the datanutrition task when the feature is enabled', () => {
++    setUp('true');
++
++    expect(comp.tasks).toContain('datanutrition');
++    const options = fixture.debugElement.queryAll(By.css('option'));
++    expect(options.length).toEqual(2);
++    expect(options[1].nativeElement.innerHTML).toContain('curation-task.task.datanutrition.label');
++  });
++
++  it('should drop the datanutrition task when the feature is disabled', () => {
++    setUp('false');
++
++    expect(comp.tasks).not.toContain('datanutrition');
++    expect(comp.tasks).toEqual(['profileformats']);
++    const options = fixture.debugElement.queryAll(By.css('option'));
++    expect(options.length).toEqual(1);
++    expect(options[0].nativeElement.innerHTML).toContain('curation-task.task.profileformats.label');
++  });
++});
+
+From f3fe8d6abec058747f57c3daab865653018a0e2d Mon Sep 17 00:00:00 2001
+From: john-zhang1 <john-zhang1@hotmail.com>
+Date: Tue, 28 Jul 2026 05:03:07 -0500
+Subject: [PATCH angular 4/4] stub NutritionLabelConfigService in the
+ full-item-page spec
+
+Injecting the service into FullItemPageComponent pulled the real
+ConfigurationDataService -> RequestService -> ObjectCacheService -> Store
+chain into the TestBed, failing 10 of 43 specs with NG0201. Verified:
+43/43 pass with the stub.
+
+(cherry picked from commit 0030d1dfe7f2975ec9690fdd21947dec26883d04)
+---
+ src/app/item-page/full/full-item-page.component.spec.ts | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/app/item-page/full/full-item-page.component.spec.ts b/src/app/item-page/full/full-item-page.component.spec.ts
+index a03c545..136dd6b 100644
+--- a/src/app/item-page/full/full-item-page.component.spec.ts
++++ b/src/app/item-page/full/full-item-page.component.spec.ts
+@@ -23,6 +23,7 @@ import {
+ } from 'rxjs';
+ 
+ import { NotifyInfoService } from '../../core/coar-notify/notify-info/notify-info.service';
++import { NutritionLabelConfigService } from '../../core/config/nutrition-label-config.service';
+ import { AuthorizationDataService } from '../../core/data/feature-authorization/authorization-data.service';
+ import { ItemDataService } from '../../core/data/item-data.service';
+ import { RemoteData } from '../../core/data/remote-data';
+@@ -148,6 +149,8 @@ describe('FullItemPageComponent', () => {
+         { provide: SignpostingDataService, useValue: signpostingDataService },
+         { provide: LinkHeadService, useValue: linkHeadService },
+         { provide: NotifyInfoService, useValue: notifyInfoService },
++        // Stubbed so the real service doesn't drag ConfigurationDataService -> Store into the TestBed.
++        { provide: NutritionLabelConfigService, useValue: { isEnabled: () => of(true) } },
+         { provide: PLATFORM_ID, useValue: 'server' },
+         { provide: ThemeService, useValue: getMockThemeService() },
+       ],
